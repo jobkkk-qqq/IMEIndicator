@@ -1,0 +1,6 @@
+# 编译产物：源码在仓库里，EXE 走 Releases 分发
+/IMEIndicator.exe
+
+# Ahk2Exe 编译中间产物
+/*.bin
+/Ahk2Exe.log
