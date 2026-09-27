@@ -3,7 +3,7 @@
 
 ; ---------------------------- 编译信息 ------------------------------------
 ; Ahk2Exe 编译时写进 EXE 的版本资源（右键属性 → 详细信息里可见）
-;@Ahk2Exe-SetVersion 1.1.0
+;@Ahk2Exe-SetVersion 1.2.0
 ;@Ahk2Exe-SetName IMEIndicator
 ;@Ahk2Exe-SetDescription 光标「中 / 英」角标指示器
 
@@ -15,6 +15,7 @@
 ;        配色随角标周围背景的明暗自动反差（深底用亮色，浅底用暗色）
 ;  定位：默认跟随鼠标；鼠标指向可输入区域（I 型光标）时，自动贴住文本插入符
 ;  运行：需 AutoHotkey v2.0；用 Ahk2Exe 编译成 exe 后，目标机器无需装 AHK
+;  自启：首次运行自动登记开机自启（注册表 Run 项），托盘菜单可随时开关
 ;  状态：主路径读窗口的 IME 上下文；提权程序（任务管理器）和 TSF 程序拿不到上下文，
 ;        自动退回读任务栏右下角的输入指示器（由 explorer 托管，普通权限即可读）
 ;  范围：覆盖常用桌面应用（记事本 / Office / 微信 / QQ / 钉钉等 Win32 程序）
@@ -125,20 +126,100 @@ gUia       := 0                             ; IUIAutomation（惰性创建，只
 gIndEl     := 0                             ; 任务栏输入指示器元素（缓存；失效就丢掉重找）
 gIndNextTry := 0                            ; 下次允许重找指示器的时间戳
 
+; ---------------------------- 开机自启 ------------------------------------
+; 首次运行自动把自己登记到 HKCU\...\Run，之后尊重用户在托盘菜单里的选择；
+; exe 被移动 / 改名后，下次启动会把登记的路径自动改过来。
+; 用注册表而不是「启动」文件夹：不需要创建快捷方式，也不需要管理员权限。
+
+RUN_KEY  := "HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_NAME := "IMEIndicator"
+APP_KEY  := "HKCU\Software\IMEIndicator"
+
+; 该登记成什么命令：编译后就是 exe 自己；从源码跑则要连解释器一起带上
+AutoStart_Target() {
+    if A_IsCompiled
+        return '"' A_ScriptFullPath '"'
+    return '"' A_AhkPath '" "' A_ScriptFullPath '"'
+}
+
+; 当前登记的命令；没登记过返回空串
+AutoStart_Get() {
+    global RUN_KEY, RUN_NAME
+    try
+        return RegRead(RUN_KEY, RUN_NAME)
+    catch
+        return ""
+}
+
+; on=true 写注册项，on=false 删掉
+AutoStart_Apply(on) {
+    global RUN_KEY, RUN_NAME
+    try {
+        if on
+            RegWrite(AutoStart_Target(), "REG_SZ", RUN_KEY, RUN_NAME)
+        else
+            RegDelete(RUN_KEY, RUN_NAME)
+    }
+}
+
+; 本程序是否运行过 —— 用它区分「首次运行」和「用户主动关掉了自启」。
+; 注意读的是这个键的「默认值」：RegRead 只给键名时读的就是默认值，
+; 而键存在但没有默认值时同样会抛错，所以下面的标记必须写在默认值上。
+AppKey_Exists() {
+    global APP_KEY
+    try {
+        RegRead(APP_KEY)
+        return true
+    } catch {
+        return false
+    }
+}
+
+AutoStart_Ensure() {
+    global APP_KEY
+    cur  := AutoStart_Get()
+    want := AutoStart_Target()
+
+    if (cur != "") {
+        if (cur != want)
+            AutoStart_Apply(true)          ; 已开启但路径对不上（exe 挪过位置）→ 修正
+    } else if !AppKey_Exists() {
+        AutoStart_Apply(true)              ; 首次运行 → 默认开启
+    }
+    try RegWrite("1", "REG_SZ", APP_KEY)   ; 标记「运行过」——必须写默认值，AppKey_Exists 才读得到
+}
+
+SyncAutoStartMenu() {
+    if (AutoStart_Get() != "")
+        A_TrayMenu.Check("开机自启")
+    else
+        A_TrayMenu.Uncheck("开机自启")
+}
+
+ToggleAutoStart(*) {
+    AutoStart_Apply(AutoStart_Get() = "")   ; 当前没开就开，开着就关
+    SyncAutoStartMenu()
+}
+
+AutoStart_Ensure()
+
 ; ---------------------------- 托盘菜单 ------------------------------------
 A_IconTip := "光标中英角标指示器"
 A_TrayMenu.Delete()
 A_TrayMenu.Add("暂停指示器", TogglePause)
 A_TrayMenu.Add("立即隐藏", HideTag)
 A_TrayMenu.Add()
+A_TrayMenu.Add("开机自启", ToggleAutoStart)
+A_TrayMenu.Add()
 A_TrayMenu.Add("退出", (*) => ExitApp())
 A_TrayMenu.Default := "暂停指示器"
+SyncAutoStartMenu()
 
 ; ---------------------------- 主循环 --------------------------------------
 SetTimer(Watch, CFG.pollMs)
 Persistent()
 
-TrayTip("光标中英角标已启动", "输入时留意光标右下角的「中 / 英」提示；右键托盘图标可暂停或退出。")
+TrayTip("光标中英角标已启动", "输入时留意光标右下角的「中 / 英」提示；右键托盘图标可暂停、开关开机自启或退出。")
 
 Watch() {
     global tagGui, CFG, tagW, tagH, dpiScale
