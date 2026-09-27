@@ -1,6 +1,12 @@
 #Requires AutoHotkey v2.0
 #SingleInstance Force
 
+; ---------------------------- 编译信息 ------------------------------------
+; Ahk2Exe 编译时写进 EXE 的版本资源（右键属性 → 详细信息里可见）
+;@Ahk2Exe-SetVersion 1.1.0
+;@Ahk2Exe-SetName IMEIndicator
+;@Ahk2Exe-SetDescription 光标「中 / 英」角标指示器
+
 ; ==========================================================================
 ;  光标「中 / 英」角标指示器   IME Caret Indicator
 ;  作用：常驻显示当前输入法状态，避免中英误录、打断思路
@@ -9,6 +15,8 @@
 ;        配色随角标周围背景的明暗自动反差（深底用亮色，浅底用暗色）
 ;  定位：默认跟随鼠标；鼠标指向可输入区域（I 型光标）时，自动贴住文本插入符
 ;  运行：需 AutoHotkey v2.0；用 Ahk2Exe 编译成 exe 后，目标机器无需装 AHK
+;  状态：主路径读窗口的 IME 上下文；提权程序（任务管理器）和 TSF 程序拿不到上下文，
+;        自动退回读任务栏右下角的输入指示器（由 explorer 托管，普通权限即可读）
 ;  范围：覆盖常用桌面应用（记事本 / Office / 微信 / QQ / 钉钉等 Win32 程序）
 ;  说明：Chrome / Electron / UWP 类应用不向 Win32 上报插入符，此时退化为跟随鼠标
 ; ==========================================================================
@@ -40,7 +48,10 @@ CFG := {
     enOnDark   : 0xD8DCE4,    ; 深底 → 英：近白灰
     lumLow     : 110,         ; 平均亮度低于此值 → 判为深底
     lumHigh    : 145,         ; 平均亮度高于此值 → 判为浅底；区间内维持原判，避免来回闪
-    sampleGap  : 3            ; 取样点距角标外框的距离（像素）
+    sampleGap  : 3,           ; 取样点距角标外框的距离（像素）
+
+    trayFallback : true,      ; IME 上下文读不到时，退回读任务栏输入指示器（任务管理器等提权程序）
+    trayRetryMs  : 2000       ; 指示器没找到时的重找间隔（毫秒）
 }
 
 ; ---------------------------- 初始化 --------------------------------------
@@ -110,6 +121,10 @@ bgDark    := false                          ; 当前判定的背景明暗
 smpX      := -99999
 smpY      := -99999
 
+gUia       := 0                             ; IUIAutomation（惰性创建，只在需要兜底时才建）
+gIndEl     := 0                             ; 任务栏输入指示器元素（缓存；失效就丢掉重找）
+gIndNextTry := 0                            ; 下次允许重找指示器的时间戳
+
 ; ---------------------------- 托盘菜单 ------------------------------------
 A_IconTip := "光标中英角标指示器"
 A_TrayMenu.Delete()
@@ -148,6 +163,8 @@ Watch() {
 
     ; 判定输入法状态：1=中，0=英，-1=无法判定
     mode := GetIMEMode(hwndFocus)
+    if (mode < 0)
+        mode := TrayIme_Mode()          ; 提权 / TSF 程序读不到 IME 上下文，退回读任务栏输入指示器
     if (mode < 0) {
         HideTag()
         return
@@ -474,6 +491,7 @@ Present(x, y) {
 
 Cleanup(*) {
     global g_hbm, g_hbmBlank, g_hdcMem, g_hdcScreen, gdiToken
+    TrayIme_Drop()
     if g_hbm
         DllCall("DeleteObject", "Ptr", g_hbm)
     if g_hbmBlank
@@ -535,18 +553,169 @@ GetIMEMode(hwnd) {
     ; 兜底：向默认 IME 窗口查询转换模式（部分第三方输入法不走上面的接口）
     hIMEWnd := DllCall("imm32\ImmGetDefaultIMEWnd", "Ptr", hwnd, "Ptr")
     if hIMEWnd {
-        mode := SendMsgTimeout(hIMEWnd, 0x0283, 0x0001, 0)   ; WM_IME_CONTROL / IMC_GETCONVERSIONMODE
-        return (mode & 0x0001) ? 1 : 0
+        r := SendMsgTimeout(hIMEWnd, 0x0283, 0x0001, 0)   ; WM_IME_CONTROL / IMC_GETCONVERSIONMODE
+        if r.ok
+            return (r.res & 0x0001) ? 1 : 0
+        ; 消息根本没送进去（提权窗口被 UIPI 拦截，GetLastError=5）：
+        ; 这时 r.res 恒为 0，照收就会把「中文」误判成「英文」——任务管理器正是如此。
+        ; 所以这里必须报「无法判定」，交给 TrayIme_Mode() 去读任务栏指示器。
     }
 
     return -1
 }
 
-; 带超时的 SendMessage，防止 IME 窗口无响应时卡住主循环
+; 带超时的 SendMessage。返回 {ok, res}：ok=false 表示消息未能送达
+; （被 UIPI 拦截或对方无响应），此时 res 无意义，不能当作查询结果用。
 SendMsgTimeout(hwnd, msg, wp, lp) {
     static SMTO_ABORTIFHUNG := 0x0002
     res := 0
-    DllCall("SendMessageTimeoutW", "Ptr", hwnd, "UInt", msg, "Ptr", wp, "Ptr", lp
-          , "UInt", SMTO_ABORTIFHUNG, "UInt", 200, "Ptr*", &res)
-    return res
+    ok := DllCall("SendMessageTimeoutW", "Ptr", hwnd, "UInt", msg, "Ptr", wp, "Ptr", lp
+                , "UInt", SMTO_ABORTIFHUNG, "UInt", 200, "Ptr*", &res)
+    return {ok: ok ? true : false, res: res}
+}
+
+; ---------------------- 任务栏输入指示器（UIA 兜底） -----------------------
+; 为什么需要：任务管理器这类提权程序的 IME 上下文普通权限拿不到，
+; WM_IME_CONTROL 也会被 UIPI 拦掉（见上）。而任务栏右下角那个输入指示器
+; 由 explorer.exe 托管、普通权限就能读，它的 UIA 名字会随当前焦点窗口的
+; 输入法状态在「中文模式 / 英语模式」之间切换 —— 正好补上这个缺口。
+;
+; 用 UIA 的原始 vtable 调用（IUIAutomation / IUIAutomationElement），
+; 不依赖任何外部库。元素只在第一次需要时查找一次，之后缓存复用；
+; 读一次名字实测 <1ms，所以放在 80ms 的轮询里也没有负担。
+
+CLSID_CUIAutomation := "{FF48DBA4-60EF-4201-AA87-54103EEF594E}"
+IID_IUIAutomation   := "{30CBE57D-D9D0-452A-AB13-7AC5AC4825EE}"
+
+UIA_Name         := 30005      ; UIA_NamePropertyId
+TREE_DESCENDANTS := 4          ; TreeScope_Descendants
+
+; 返回 1=中，0=英，-1=读不到
+TrayIme_Mode() {
+    global gIndEl, gIndNextTry, CFG
+    if !CFG.trayFallback
+        return -1
+
+    if gIndEl {
+        m := TrayIme_Parse(TrayIme_Name(gIndEl))
+        if (m >= 0)
+            return m
+        TrayIme_Drop()                  ; 元素失效（explorer 重启、任务栏重排等），丢掉重找
+    }
+
+    if (A_TickCount < gIndNextTry)
+        return -1
+    gIndNextTry := A_TickCount + CFG.trayRetryMs
+
+    gIndEl := TrayIme_Find()
+    if !gIndEl
+        return -1
+    return TrayIme_Parse(TrayIme_Name(gIndEl))
+}
+
+TrayIme_Drop() {
+    global gIndEl
+    if gIndEl {
+        UiaRelease(gIndEl)
+        gIndEl := 0
+    }
+}
+
+; 在任务栏（Shell_TrayWnd）子树里找输入指示器：名字里带「模式 / mode」的那个
+TrayIme_Find() {
+    global gUia, CLSID_CUIAutomation, IID_IUIAutomation, TREE_DESCENDANTS
+
+    if !gUia {
+        try gUia := ComObject(CLSID_CUIAutomation, IID_IUIAutomation)
+        catch
+            return 0
+    }
+
+    tray := DllCall("FindWindowW", "Str", "Shell_TrayWnd", "Ptr", 0, "Ptr")
+    if !tray
+        return 0
+
+    root := 0
+    if (UiaCall(gUia.Ptr, 6, "Ptr", tray, "Ptr*", &root) != 0 || !root)   ; ElementFromHandle
+        return 0
+
+    cond := 0
+    if (UiaCall(gUia.Ptr, 21, "Ptr*", &cond) != 0 || !cond) {             ; CreateTrueCondition
+        UiaRelease(root)
+        return 0
+    }
+
+    arr := 0
+    hr := UiaCall(root, 6, "Int", TREE_DESCENDANTS, "Ptr", cond, "Ptr*", &arr)   ; FindAll
+    UiaRelease(cond)
+    UiaRelease(root)
+    if (hr != 0 || !arr)
+        return 0
+
+    n := 0
+    UiaCall(arr, 3, "Int*", &n)                                          ; get_Length
+    found := 0
+    Loop n {
+        el := 0
+        if (UiaCall(arr, 4, "Int", A_Index - 1, "Ptr*", &el) != 0 || !el)  ; GetElement
+            continue
+        if (!found && TrayIme_Parse(TrayIme_Name(el)) >= 0)
+            found := el
+        else
+            UiaRelease(el)
+    }
+    UiaRelease(arr)
+    return found
+}
+
+TrayIme_Name(el) {
+    global UIA_Name
+    v := Buffer(24, 0)
+    if (UiaCall(el, 10, "Int", UIA_Name, "Ptr", v) != 0)                 ; GetCurrentPropertyValue
+        return ""
+    if (NumGet(v, 0, "UShort") != 8)                                     ; 不是 VT_BSTR
+        return ""
+    p := NumGet(v, 8, "Ptr")
+    s := p ? StrGet(p, "UTF-16") : ""
+    if p
+        DllCall("oleaut32\SysFreeString", "Ptr", p)
+    return s
+}
+
+; 指示器名字 → 模式。名字形如「任务栏输入指示 中文模式 ...」
+; 另一个同类元素是「任务栏输入指示 简体中文(中国大陆) 微软五笔 ...」，
+; 它不含「模式」，所以不会被误判。
+TrayIme_Parse(nm) {
+    if (nm = "")
+        return -1
+    if (InStr(nm, "中文模式") || InStr(nm, "Chinese mode") || InStr(nm, "Chinese Mode"))
+        return 1
+    if (InStr(nm, "英语模式") || InStr(nm, "English mode") || InStr(nm, "English Mode"))
+        return 0
+    if (InStr(nm, "模式") || InStr(nm, "mode") || InStr(nm, "Mode")) {   ; 其他语言环境兜底
+        if (InStr(nm, "指示") || InStr(nm, "ndicator")) {               ; 先确认是「输入指示器」那一项
+            if InStr(nm, "中")
+                return 1
+            if InStr(nm, "英")
+                return 0
+        }
+    }
+    return -1
+}
+
+; 按 vtable 序号直接调用 COM 方法（AHK 里最省事，不必依赖类型库）
+UiaCall(ptr, index, args*) {
+    fn := NumGet(NumGet(ptr, 0, "Ptr"), index * A_PtrSize, "Ptr")
+    params := ["Ptr", ptr]
+    for a in args
+        params.Push(a)
+    params.Push("Int")
+    return DllCall(fn, params*)
+}
+
+UiaRelease(p) {
+    if !p
+        return
+    fn := NumGet(NumGet(p, 0, "Ptr"), 2 * A_PtrSize, "Ptr")
+    DllCall(fn, "Ptr", p)
 }
