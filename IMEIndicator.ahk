@@ -15,7 +15,7 @@
 ;        配色随角标周围背景的明暗自动反差（深底用亮色，浅底用暗色）
 ;  定位：默认跟随鼠标；鼠标指向可输入区域（I 型光标）时，自动贴住文本插入符
 ;  运行：需 AutoHotkey v2.0；用 Ahk2Exe 编译成 exe 后，目标机器无需装 AHK
-;  自启：首次运行自动登记开机自启（注册表 Run 项），托盘菜单可随时开关
+;  自启：首次运行自动登记开机自启；每次运行自动体检并修复（含 Win8+ 的「禁用」标志）
 ;  状态：主路径读窗口的 IME 上下文；提权程序（任务管理器）和 TSF 程序拿不到上下文，
 ;        自动退回读任务栏右下角的输入指示器（由 explorer 托管，普通权限即可读）
 ;  范围：覆盖常用桌面应用（记事本 / Office / 微信 / QQ / 钉钉等 Win32 程序）
@@ -127,13 +127,21 @@ gIndEl     := 0                             ; 任务栏输入指示器元素（�
 gIndNextTry := 0                            ; 下次允许重找指示器的时间戳
 
 ; ---------------------------- 开机自启 ------------------------------------
-; 首次运行自动把自己登记到 HKCU\...\Run，之后尊重用户在托盘菜单里的选择；
-; exe 被移动 / 改名后，下次启动会把登记的路径自动改过来。
-; 用注册表而不是「启动」文件夹：不需要创建快捷方式，也不需要管理员权限。
+; 目标：Win7 / 8 / 8.1 / 10 / 11 都能开机自动运行。
+;
+; 只写 HKCU\...\Run 是不够的。Win8 起系统还在
+; Explorer\StartupApproved\Run 下用一个二进制值记录该启动项是「启用」还是
+; 「禁用」（首字节 02=启用，03=禁用）。任务管理器的「启动」页，以及 360、
+; 电脑管家这类优化软件，都是改这个值来禁用的 —— 只写 Run 项而不管它，就会
+; 出现「注册表里明明有、开机却不启动」。这正是 Win10 上失效的典型原因。
+;
+; 所以每次运行都做一次体检：Run 项在不在、路径对不对、有没有被标成禁用，
+; 有问题就地修好。用户主动在托盘菜单里关掉的，则不再自动打开。
 
-RUN_KEY  := "HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
-RUN_NAME := "IMEIndicator"
-APP_KEY  := "HKCU\Software\IMEIndicator"
+RUN_KEY      := "HKCU\Software\Microsoft\Windows\CurrentVersion\Run"
+RUN_NAME     := "IMEIndicator"
+APP_KEY      := "HKCU\Software\IMEIndicator"
+APPROVED_KEY := "HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"
 
 ; 该登记成什么命令：编译后就是 exe 自己；从源码跑则要连解释器一起带上
 AutoStart_Target() {
@@ -151,15 +159,112 @@ AutoStart_Get() {
         return ""
 }
 
-; on=true 写注册项，on=false 删掉
+; on=true 写 Run 项，on=false 删掉。返回是否成功。
 AutoStart_Apply(on) {
     global RUN_KEY, RUN_NAME
+    ok := false
     try {
-        if on
+        if on {
             RegWrite(AutoStart_Target(), "REG_SZ", RUN_KEY, RUN_NAME)
-        else
+            ok := true
+        } else {
             RegDelete(RUN_KEY, RUN_NAME)
+            ok := true
+        }
     }
+    if on
+        AutoStart_Approve()                    ; 顺手把「禁用」标志改回启用
+    else
+        AutoStart_DropApproved()               ; 关掉时一并清掉标志，不留残渣
+    return ok
+}
+
+; ---- Win8+ 的「启用 / 禁用」标志（Win7 没有这个键，全部静默跳过）----
+; 这里直接调注册表 API 读写原始字节，不用 AHK 的 RegRead / RegWrite：
+;   实测 AHK v2.0.28 下，RegRead 读 REG_BINARY 拿到的是空串，
+;   RegWrite 把 Buffer 写进 REG_BINARY 会写成 0 长度 —— 这两个坑会让
+;   「禁用」标志既读不出、也修不好，正是 Win10 上开机不启动的关键。
+; 打开键时带 KEY_WOW64_64KEY：无论本程序是 32 位还是 64 位编译，
+; 都落到 explorer 实际使用的那份注册表视图上。
+REG_HKCU      := 0x80000001              ; HKEY_CURRENT_USER
+REG_READ_ALL  := 0x20019 | 0x0100        ; KEY_READ  | KEY_WOW64_64KEY
+REG_WRITE_ALL := 0x20006 | 0x0100        ; KEY_WRITE | KEY_WOW64_64KEY
+
+; "HKCU\Software\..." → "Software\..."：RegOpenKeyExW 要的是相对子键路径
+RegSubPath(full) {
+    return (SubStr(full, 1, 5) = "HKCU\") ? SubStr(full, 6) : full
+}
+
+; 读值首字节。三种情形要分开：
+;   键或值根本不存在 → -1（无记录，系统视作启用，不去动它）
+;   值存在但是空的   → 0（非「启用」，交给体检改回 02）
+;   正常读出         → 首字节
+RegBinaryFirstByte(fullPath, valueName) {
+    global REG_HKCU, REG_READ_ALL
+    hKey := 0
+    if (DllCall("advapi32\RegOpenKeyExW", "Ptr", REG_HKCU, "Str", RegSubPath(fullPath)
+        , "UInt", 0, "UInt", REG_READ_ALL, "Ptr*", &hKey) != 0)
+        return -1
+    size := 0
+    q := DllCall("advapi32\RegQueryValueExW", "Ptr", hKey, "Str", valueName
+        , "Ptr", 0, "Ptr", 0, "Ptr", 0, "UInt*", &size)
+    if (q != 0 || size < 1) {
+        DllCall("advapi32\RegCloseKey", "Ptr", hKey)
+        return (q != 0) ? -1 : 0
+    }
+    buf := Buffer(size, 0)
+    r := DllCall("advapi32\RegQueryValueExW", "Ptr", hKey, "Str", valueName
+        , "Ptr", 0, "Ptr", 0, "Ptr", buf, "UInt*", &size)
+    DllCall("advapi32\RegCloseKey", "Ptr", hKey)
+    return (r = 0 && size >= 1) ? NumGet(buf, 0, "UChar") : -1
+}
+
+; 写一个 REG_BINARY 值：首字节 firstByte，其余补零，共 size 字节。
+; 只在目标键已存在时写 —— Win7 没有这个键，就什么都不做，不凭空造键。
+; 返回是否写入成功。
+RegWriteBinaryFlag(fullPath, valueName, firstByte, size) {
+    global REG_HKCU, REG_WRITE_ALL
+    hKey := 0
+    if (DllCall("advapi32\RegOpenKeyExW", "Ptr", REG_HKCU, "Str", RegSubPath(fullPath)
+        , "UInt", 0, "UInt", REG_WRITE_ALL, "Ptr*", &hKey) != 0)
+        return false
+    buf := Buffer(size, 0)
+    NumPut("UChar", firstByte, buf, 0)
+    r := DllCall("advapi32\RegSetValueExW", "Ptr", hKey, "Str", valueName, "UInt", 0
+        , "UInt", 3, "Ptr", buf, "UInt", size)          ; REG_BINARY = 3
+    DllCall("advapi32\RegCloseKey", "Ptr", hKey)
+    return (r = 0)
+}
+
+; 删除该值（键或值不存在都算成功，幂等）
+RegRemoveBinaryValue(fullPath, valueName) {
+    global REG_HKCU, REG_WRITE_ALL
+    hKey := 0
+    if (DllCall("advapi32\RegOpenKeyExW", "Ptr", REG_HKCU, "Str", RegSubPath(fullPath)
+        , "UInt", 0, "UInt", REG_WRITE_ALL, "Ptr*", &hKey) != 0)
+        return
+    DllCall("advapi32\RegDeleteValueW", "Ptr", hKey, "Str", valueName)
+    DllCall("advapi32\RegCloseKey", "Ptr", hKey)
+}
+
+; 返回 1=启用，0=被禁用（首字节非 02 一律当禁用，交给体检修复），-1=无记录（系统视作启用）
+AutoStart_Approved() {
+    global APPROVED_KEY, RUN_NAME
+    b := RegBinaryFirstByte(APPROVED_KEY, RUN_NAME)
+    if (b < 0)
+        return -1
+    return (b = 0x02) ? 1 : 0
+}
+
+; 把标志写成「启用」（首字节 02，其余补零，共 12 字节）
+AutoStart_Approve() {
+    global APPROVED_KEY, RUN_NAME
+    RegWriteBinaryFlag(APPROVED_KEY, RUN_NAME, 0x02, 12)
+}
+
+AutoStart_DropApproved() {
+    global APPROVED_KEY, RUN_NAME
+    RegRemoveBinaryValue(APPROVED_KEY, RUN_NAME)
 }
 
 ; 本程序是否运行过 —— 用它区分「首次运行」和「用户主动关掉了自启」。
@@ -182,11 +287,38 @@ AutoStart_Ensure() {
 
     if (cur != "") {
         if (cur != want)
-            AutoStart_Apply(true)          ; 已开启但路径对不上（exe 挪过位置）→ 修正
+            AutoStart_Apply(true)              ; 已登记但路径对不上（exe 挪过位置）→ 修正
+        else if (AutoStart_Approved() = 0)
+            AutoStart_Approve()                ; 登记项在、却被标成「禁用」→ 重新启用
     } else if !AppKey_Exists() {
-        AutoStart_Apply(true)              ; 首次运行 → 默认开启
+        AutoStart_Apply(true)                  ; 首次运行 → 默认开启
     }
-    try RegWrite("1", "REG_SZ", APP_KEY)   ; 标记「运行过」——必须写默认值，AppKey_Exists 才读得到
+    try RegWrite("1", "REG_SZ", APP_KEY)       ; 标记「运行过」——必须写默认值，AppKey_Exists 才读得到
+}
+
+; 托盘菜单的「自启状态…」：把当前登记情况摊开，方便在出问题的机器上定位
+ShowAutoStartInfo(*) {
+    ap := AutoStart_Approved()
+    if (ap = 0)
+        apText := "被禁用  ← Win10 上开机不启动通常就是这里被标成了禁用"
+    else if (ap = 1)
+        apText := "已启用"
+    else
+        apText := "无记录（系统视作启用）"
+
+    cur := AutoStart_Get()
+    msg := Format(
+        "启动命令：{1}`n"
+        "目标路径：{2}`n`n"
+        "系统启动项开关：{3}`n`n"
+        "运行环境：{4}，{5} 位系统，本程序为 {6} 位",
+        cur = "" ? "（未登记）" : cur,
+        AutoStart_Target(),
+        apText,
+        A_OSVersion,
+        A_Is64bitOS ? 64 : 32,
+        A_PtrSize * 8)
+    MsgBox(msg, "开机自启状态", "Iconi")
 }
 
 SyncAutoStartMenu() {
@@ -210,6 +342,7 @@ A_TrayMenu.Add("暂停指示器", TogglePause)
 A_TrayMenu.Add("立即隐藏", HideTag)
 A_TrayMenu.Add()
 A_TrayMenu.Add("开机自启", ToggleAutoStart)
+A_TrayMenu.Add("自启状态…", ShowAutoStartInfo)
 A_TrayMenu.Add()
 A_TrayMenu.Add("退出", (*) => ExitApp())
 A_TrayMenu.Default := "暂停指示器"
